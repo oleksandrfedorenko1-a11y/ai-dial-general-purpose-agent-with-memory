@@ -20,10 +20,12 @@ class GeneralPurposeAgent:
             endpoint: str,
             system_prompt: str,
             tools: list[BaseTool],
+            user_profile: str = "",
     ):
         self.endpoint = endpoint
         self.system_prompt = system_prompt
         self.tools = tools
+        self.user_profile = user_profile
         self._tools_dict: dict[str, BaseTool] = {
             tool.name: tool
             for tool in tools
@@ -103,12 +105,16 @@ class GeneralPurposeAgent:
         return assistant_message
 
     def _prepare_messages(self, messages: list[Message]) -> list[dict[str, Any]]:
+        system_content = self.system_prompt
+        if self.user_profile:
+            system_content += "\n\n---\n## Known User Information\n" + self.user_profile
+
         unpacked_messages = unpack_messages(messages, self.state[TOOL_CALL_HISTORY_KEY])
         unpacked_messages.insert(
             0,
             {
                 "role": Role.SYSTEM.value,
-                "content": self.system_prompt,
+                "content": system_content,
             }
         )
 

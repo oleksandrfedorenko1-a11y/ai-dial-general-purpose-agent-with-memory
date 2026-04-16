@@ -1,7 +1,8 @@
+import asyncio
 import os
 
 from aidial_sdk import DIALApp
-from aidial_sdk.chat_completion import ChatCompletion, Request, Response
+from aidial_sdk.chat_completion import ChatCompletion, Request, Response, Role
 
 from task.agent import GeneralPurposeAgent
 from task.prompts import SYSTEM_PROMPT
@@ -10,16 +11,15 @@ from task.tools.deployment.image_generation_tool import ImageGenerationTool
 from task.tools.files.file_content_extraction_tool import FileContentExtractionTool
 from task.tools.mcp.mcp_client import MCPClient
 from task.tools.mcp.mcp_tool import MCPTool
-from task.tools.memory.memory_delete_tool import DeleteMemoryTool
-from task.tools.memory.memory_search_tool import SearchMemoryTool
-from task.tools.memory.memory_store import LongTermMemoryStore
-from task.tools.memory.memory_store_tool import StoreMemoryTool
+from task.tools.profile.profile_updater import ProfileUpdater
+from task.tools.profile.user_profile_store import UserProfileStore
 from task.tools.py_interpreter.python_code_interpreter_tool import PythonCodeInterpreterTool
 from task.tools.rag.document_cache import DocumentCache
 from task.tools.rag.rag_tool import RagTool
 
 DIAL_ENDPOINT = os.getenv('DIAL_ENDPOINT', "http://localhost:8080")
 DEPLOYMENT_NAME = os.getenv('DEPLOYMENT_NAME', 'gpt-4o')
+MINI_DEPLOYMENT_NAME = os.getenv('MINI_DEPLOYMENT_NAME', 'gpt-4o-mini')
 # DEPLOYMENT_NAME = os.getenv('DEPLOYMENT_NAME', 'claude-sonnet-3-7')
 
 
@@ -27,7 +27,12 @@ class GeneralPurposeAgentApplication(ChatCompletion):
 
     def __init__(self):
         self.tools: list[BaseTool] = []
-        self.memory_store = LongTermMemoryStore(endpoint=DIAL_ENDPOINT)
+        self.profile_store = UserProfileStore(endpoint=DIAL_ENDPOINT)
+        self.profile_updater = ProfileUpdater(
+            endpoint=DIAL_ENDPOINT,
+            mini_deployment_name=MINI_DEPLOYMENT_NAME,
+            profile_store=self.profile_store,
+        )
 
     async def _get_mcp_tools(self, url: str) -> list[BaseTool]:
         try:
@@ -59,10 +64,6 @@ class GeneralPurposeAgentApplication(ChatCompletion):
                 tool_name="execute_code",
                 dial_endpoint=DIAL_ENDPOINT
             ),
-
-            StoreMemoryTool(memory_store=self.memory_store),
-            SearchMemoryTool(memory_store=self.memory_store),
-            DeleteMemoryTool(memory_store=self.memory_store),
         ]
 
         tools.extend(await self._get_mcp_tools("http://localhost:8051/mcp"))
@@ -74,16 +75,32 @@ class GeneralPurposeAgentApplication(ChatCompletion):
         if not self.tools:
             self.tools = await self._create_tools()
 
+        user_profile = await self.profile_store.load_profile(request.api_key)
+
         with response.create_single_choice() as choice:
-            await GeneralPurposeAgent(
+            final_message = await GeneralPurposeAgent(
                 endpoint=DIAL_ENDPOINT,
                 system_prompt=SYSTEM_PROMPT,
-                tools=self.tools
+                tools=self.tools,
+                user_profile=user_profile,
             ).handle_request(
                 choice=choice,
                 deployment_name=DEPLOYMENT_NAME,
                 request=request,
                 response=response,
+            )
+
+            last_user_msg = next(
+                (m.content for m in reversed(request.messages)
+                 if m.role == Role.USER and isinstance(m.content, str)),
+                ""
+            )
+            asyncio.create_task(
+                self.profile_updater.maybe_update_profile(
+                    api_key=request.api_key,
+                    user_message=last_user_msg,
+                    assistant_message=final_message.content or "",
+                )
             )
 
 
@@ -96,6 +113,5 @@ if __name__ == "__main__":
 
     config = uvicorn.Config(app, port=5030, host="0.0.0.0")
     server = uvicorn.Server(config)
-    import asyncio
 
     asyncio.run(server.serve())
